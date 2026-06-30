@@ -15,6 +15,13 @@ import (
 	"github.com/Sakayori-Iroha-168/Software_Teamwork/services/qa/internal/service/agent"
 )
 
+// CitationSaver persists citation snapshots produced during an agent run.
+// It is set via SetCitationSaver after construction to break the initialization
+// cycle between QAService and ResourceService.
+type CitationSaver interface {
+	SaveCitations(ctx context.Context, messageID string, citations []Citation) ([]Citation, error)
+}
+
 type Code string
 
 const (
@@ -230,11 +237,19 @@ type RuntimeProvider interface {
 }
 
 type QAService struct {
-	repository Repository
-	runtime    RuntimeProvider
-	now        func() time.Time
-	activeMu   sync.Mutex
-	activeRuns map[string]context.CancelFunc
+	repository    Repository
+	runtime       RuntimeProvider
+	citationSaver CitationSaver
+	now           func() time.Time
+	activeMu      sync.Mutex
+	activeRuns    map[string]context.CancelFunc
+}
+
+// SetCitationSaver wires the citation saver after construction. It is not
+// required; when nil, citations from search_knowledge results are silently
+// discarded rather than causing the answer to fail.
+func (s *QAService) SetCitationSaver(saver CitationSaver) {
+	s.citationSaver = saver
 }
 
 func NewQAService(repository Repository, runtime RuntimeProvider) (*QAService, error) {
@@ -490,6 +505,21 @@ func (s *QAService) Ask(ctx context.Context, userID, conversationID string, inpu
 	}
 	assistantMessage.Content = result.Final.Content
 	assistantMessage.Status = "completed"
+
+	// Extract and persist citation snapshots from search_knowledge tool results.
+	// This is best-effort: a save failure does not fail the answer.
+	var savedCitations []Citation
+	if s.citationSaver != nil {
+		if raw := extractCitationsFromMessages(result.Messages); len(raw) > 0 {
+			if saved, saveErr := s.citationSaver.SaveCitations(ctx, assistantMessage.ID, raw); saveErr == nil {
+				savedCitations = saved
+				for _, c := range savedCitations {
+					emit("citation.delta", map[string]any{"citation": c})
+				}
+			}
+		}
+	}
+
 	emit("answer.delta", map[string]any{"messageId": assistantMessage.ID, "text": assistantMessage.Content, "index": 0})
 	emit("answer.completed", map[string]any{"responseRunId": run.ID, "messageId": assistantMessage.ID})
 	cleanupCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), 5*time.Second)
@@ -504,7 +534,11 @@ func (s *QAService) Ask(ctx context.Context, userID, conversationID string, inpu
 	if err != nil {
 		return AskResult{}, fmt.Errorf("finalize response run: %w", err)
 	}
-	return AskResult{UserMessage: userMessage, AssistantMessage: assistantMessage, ResponseRun: run, Citations: []any{}, ReasoningSteps: steps}, nil
+	citationsAny := make([]any, len(savedCitations))
+	for i, c := range savedCitations {
+		citationsAny[i] = c
+	}
+	return AskResult{UserMessage: userMessage, AssistantMessage: assistantMessage, ResponseRun: run, Citations: citationsAny, ReasoningSteps: steps}, nil
 }
 
 func (s *QAService) saveReplayRecords(ctx context.Context, userID, runID, assistantMessageID string, steps []ReasoningStep, events []StreamEvent) error {
@@ -701,6 +735,65 @@ func truncateRunes(value string, limit int) string {
 		return value
 	}
 	return string(runes[:limit])
+}
+
+// extractCitationsFromMessages scans agent messages for search_knowledge tool
+// results and converts them to Citation snapshots with stable citationNo values.
+// The tool name may be prefixed (e.g. "knowledge__search_knowledge") due to MCP
+// aliasing, so we match by suffix.
+func extractCitationsFromMessages(messages []agent.Message) []Citation {
+	var all []Citation
+	citationNo := 0
+	for _, msg := range messages {
+		if msg.Role != agent.RoleTool || !strings.HasSuffix(msg.Name, "search_knowledge") {
+			continue
+		}
+		var parsed struct {
+			Results []struct {
+				KnowledgeBaseID string         `json:"knowledgeBaseId"`
+				DocumentID      string         `json:"documentId"`
+				DocumentName    string         `json:"documentName"`
+				ChunkID         string         `json:"chunkId"`
+				SectionPath     string         `json:"sectionPath"`
+				QuoteText       string         `json:"quoteText"`
+				ContentPreview  string         `json:"contentPreview"`
+				Context         string         `json:"context"`
+				PageNumber      *int           `json:"pageNumber"`
+				Score           *float64       `json:"score"`
+				RerankScore     *float64       `json:"rerankScore"`
+				Metadata        map[string]any `json:"metadata"`
+			} `json:"results"`
+		}
+		if err := json.Unmarshal([]byte(msg.Content), &parsed); err != nil || len(parsed.Results) == 0 {
+			continue
+		}
+		for _, r := range parsed.Results {
+			citationNo++
+			text := r.QuoteText
+			if text == "" {
+				text = r.ContentPreview
+			}
+			meta := r.Metadata
+			if meta == nil {
+				meta = map[string]any{}
+			}
+			all = append(all, Citation{
+				CitationNo:      citationNo,
+				KnowledgeBaseID: r.KnowledgeBaseID,
+				DocumentID:      r.DocumentID,
+				DocumentName:    r.DocumentName,
+				ChunkID:         r.ChunkID,
+				SectionPath:     r.SectionPath,
+				Text:            text,
+				Context:         r.Context,
+				PageNumber:      r.PageNumber,
+				Score:           r.Score,
+				RerankScore:     r.RerankScore,
+				Metadata:        meta,
+			})
+		}
+	}
+	return all
 }
 
 func normalizeConversationListOptions(options ConversationListOptions) (ConversationListOptions, error) {
